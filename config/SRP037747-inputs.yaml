@@ -1,0 +1,15 @@
+---
+# File locations on Odyssey
+inputs:
+  name_base: 'HB%sT'
+  confirmed: config/confirmed_snps.csv
+  skip: [['7', 18993867, 'T', 'A']]
+  batches: [2, 3, 5, 6, 8, 9]
+  callers: [freebayes, mutect, vardict]
+dirs:
+  final: final
+  out: compare
+resources:
+  ref_file: /n/regal/hsph_bioinfo/bcbio_nextgen/genomes/Hsapiens/GRCh37/seq/GRCh37.fa
+  region_file: work/inputs/bcbio/regions/truseq_exome-GRCh37.bed
+  bcbio_variation: /n/regal/hsph_bioinfo/bcbio_nextgen/share/java/bcbio_variation/bcbio.variation-0.2.0-standalone.jar
