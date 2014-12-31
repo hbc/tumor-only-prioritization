@@ -16,6 +16,7 @@ import itertools
 import os
 import sys
 
+from tabulate import tabulate
 import toolz as tz
 import vcf
 import yaml
@@ -31,6 +32,8 @@ def main(config_file):
     evals = [evaluate_tumoronly(b, c, config, confirmed.get(b, []))
              for b, c in itertools.product(tz.get_in(["inputs", "batches"], config),
                                            tz.get_in(["inputs", "callers"], config))]
+    header = ["sample", "caller", "confirmed", "enrichment", "additional", "filtered"]
+    print tabulate(evals, header, tablefmt="orgtbl")
 
 def evaluate_tumoronly(batch, caller, config, confirmed):
     name = tz.get_in(["inputs", "name_base"], config) % batch
@@ -60,9 +63,24 @@ def evaluate_tumoronly(batch, caller, config, confirmed):
     print "--", batch, caller
     print "Confirmed: total %s, concordant %s, discordant %s" % (len(confirmed), col, dol)
     con = stats["concordant"]["concordant"]["total"]
-    dis = sum(stats["discordant"]["snp"]["extra"].values() +
-              tz.get_in(["discordant", "indel", "extra"], stats, {}).values())
-    print "Total: concordant %s, extra %s" % (con, dis)
+    missing = sum(stats["discordant"]["snp"]["missing"].values() +
+                  tz.get_in(["discordant", "indel", "missing"], stats, {}).values())
+    extra = sum(stats["discordant"]["snp"]["extra"].values() +
+                tz.get_in(["discordant", "indel", "extra"], stats, {}).values())
+    print "Total: concordant %s, missing %s, extra %s" % (con, missing, extra)
+    enrichment, filtered = _find_filtered(t_file, extra)
+    return [name, caller, "%s / %s" % (col, len(confirmed)), enrichment, extra, filtered]
+
+def _find_filtered(fname, extra):
+    """Identify the filtered inputs in the original VCF file.
+    """
+    filtered = 0
+    with utils.open_gzipsafe(fname) as in_handle:
+        for rec in vcf.Reader(in_handle, fname):
+            if "LowPriority" in rec.FILTER:
+                filtered += 1
+    enrichment = "%sx" % (int((extra + filtered) / float(extra)))
+    return enrichment, filtered
 
 def check_overlap(confirmed, call_file):
     confirmed = set(confirmed)
