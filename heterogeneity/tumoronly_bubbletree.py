@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 """Run a tumor-only BubbleTree analysis using VarDict and Seq2c inputs.
 """
+import collections
 import csv
 import glob
+import gzip
 import math
 import os
 import subprocess
@@ -18,34 +20,41 @@ from bcbio import utils
 from bcbio.heterogeneity import bubbletree
 from bcbio.variation import vcfutils
 
-def main(vardict_flat, seq2c_input, annotate_conf):
+def main(vardict_flat, seq2c_input, annotate_conf, priority_file, name):
     var_samples = read_samples(vardict_flat)
     cnv_samples = read_samples(seq2c_input)
-    out_file = "dlbcl-breast-lung-af-dist.pdf"
-    sample_freqs = {}
-    with PdfPages(out_file) as pdf_out:
-        for sample in sorted(list(var_samples & cnv_samples)):
-            print sample
+    freq_out_file = "%s-dlbcl-af-dist.pdf" % name
+    sample_freqs = collections.defaultdict(dict)
+    with PdfPages(freq_out_file) as pdf_out:
+        for i, sample in enumerate(sorted(list(var_samples & cnv_samples))):
             sample_vcf = annotate_vcf(sample_variants_as_vcf(sample, vardict_flat), annotate_conf)
             seq2c_cns = sample_seq2c_as_cns(sample, seq2c_input)
+            known_afs = prioritize_variants(sample_vcf, seq2c_cns, priority_file)
+            print sample, known_afs
             vrn_info = {"vrn_file": sample_vcf, "variantcaller": "vardict"}
             calls_by_name = {"seq2c": {"cns": seq2c_cns,
                                        "variantcaller": "seq2c"}}
             data = {"dirs": {"work": os.getcwd()},
                     "rgnames": {"sample": sample}}
             somatic_info = vcfutils.PairedData(None, sample, None, None, None, None, data, None)
-            bubbletree.run(vrn_info, calls_by_name, somatic_info, do_plots=False)
-            freqs = plot_frequencies(sample, sample_vcf, seq2c_cns,
-                                     glob.glob(os.path.join("heterogeneity", sample, "bubbletree",
-                                                            "*_prevalence.txt"))[0],
-                                     pdf_out)
-            sample_freqs[sample] = freqs
-    comparison_plot(sample_freqs)
+            bubbletree_out = glob.glob(os.path.join("heterogeneity", sample, "bubbletree",
+                                                    "*_prevalence.txt"))
+            if len(bubbletree_out) == 0:
+                bubbletree.run(vrn_info, calls_by_name, somatic_info, do_plots=False)
+                bubbletree_out = glob.glob(os.path.join("heterogeneity", sample, "bubbletree",
+                                                        "*_prevalence.txt"))
+            freqs = plot_frequencies(sample, sample_vcf, seq2c_cns, bubbletree_out[0], pdf_out)
+            for driver in known_afs:
+                sample_freqs[driver][sample] = freqs
+    for driver, cur_sample_freqs in sample_freqs.items():
+        if len(cur_sample_freqs) > 1:
+            print driver, len(cur_sample_freqs)
+            comparison_out_file = "%s-af-comparison-%s.pdf" % (name, driver.split(":")[-1])
+            comparison_plot(driver, cur_sample_freqs, comparison_out_file)
 
-def comparison_plot(sample_freqs):
-    out_file = "breast-af-comparison.pdf"
+def comparison_plot(driver, sample_freqs, out_file):
     metrics = {"sample": [], "af": []}
-    for sample, freqs in sample_freqs.items():
+    for sample, freqs in sorted(sample_freqs.items()):
         sample = sample.split("_")[0].replace("AZ-", "")
         metrics["sample"].extend([sample] * len(freqs))
         metrics["af"].extend(freqs)
@@ -53,9 +62,12 @@ def comparison_plot(sample_freqs):
     df = pd.DataFrame(metrics)
     sns.despine()
     sns.set(style="white")
-    g = sns.swarmplot(x="af", y="sample", data=df)
+    g = sns.violinplot(x="af", y="sample", data=df, inner=None)
+    #sns.swarmplot(x="af", y="sample", data=df, color="w", alpha=.5)
+    g.set_title(driver)
     g.set_xlim(0, 1.0)
     g.figure.savefig(out_file)
+    plt.clf()
 
 def plot_frequencies(sample, sample_vcf, seq2c_cns, bubbletree_out, pdf_out):
     """Plot non-germline frequencies, adjusted by purity and copy number.
@@ -87,12 +99,70 @@ def plot_frequencies(sample, sample_vcf, seq2c_cns, bubbletree_out, pdf_out):
     plt.clf()
     return freqs
 
+def prioritize_variants(vcf_file, cns_file, priority_file):
+    """Find known cancer associated genes in small variants and CNVs.
+    """
+    known = _prioritize_vcf(vcf_file, priority_file) + _prioritize_cns(cns_file, priority_file)
+    if known:
+        if len(known) > 7:
+            return ["multiple"]
+        else:
+            return list(set(known))
+    else:
+        return ["unclassified"]
+
+def _prioritize_vcf(in_file, priority_file):
+    out_file = "%s-known.vcf.gz" % utils.splitext_plus(in_file)[0]
+    if not utils.file_uptodate(out_file, in_file):
+        cmd = ["bcbio-prioritize", "known", "-i", in_file, "-k", priority_file, "-o", out_file]
+        subprocess.check_call(cmd)
+    known = []
+    if vcfutils.vcf_has_variants(out_file):
+        for rec in pysam.VariantFile(out_file):
+            if not bubbletree.is_population_germline(rec):
+                known.extend(rec.info["KNOWN"])
+    return known
+
+def _chr_sort(region):
+    chrom, start, end = region[:3]
+    chrom = chrom.replace("chr", "")
+    try:
+        chrom = int(chrom)
+    except ValueError:
+        pass
+    return (chrom, int(start), int(end))
+
+def _prioritize_cns(in_file, priority_file):
+    out_file = "%s-known.bed.gz" % utils.splitext_plus(in_file)[0]
+    if not utils.file_uptodate(out_file, in_file):
+        bed_file = "%s.bed" % utils.splitext_plus(in_file)[0]
+        if not utils.file_uptodate(bed_file, in_file):
+            cn_changes = []
+            with open(in_file) as in_handle:
+                in_handle.next()  # header
+                for chrom, start, end, gene, log2, _ in (x.split("\t") for x in in_handle):
+                    cn = math.pow(2, float(log2)) * 2.0
+                    if cn < 1 or cn > 4:
+                        cn_changes.append((chrom.replace("chr", ""), start, end, "%s_%.1f" % (gene, cn)))
+            with open(bed_file, "w") as out_handle:
+                for chrom, start, end, gene in sorted(cn_changes, key=_chr_sort):
+                    out_handle.write("%s\t%s\t%s\t%s\n" % (chrom, start, end, gene))
+        cmd = ["bcbio-prioritize", "known", "-i", bed_file, "-k", priority_file, "-o", out_file]
+        subprocess.check_call(cmd)
+    known = []
+    with gzip.open(out_file) as in_handle:
+        for line in in_handle:
+            match = line.split("\t")[-1]
+            if match.strip():
+                known.append(match.strip())
+    return known
+
 def cns_to_relative_copy(in_cns):
     out = []
     with open(in_cns) as in_handle:
         in_handle.next()  # header
         for chrom, start, end, gene, log2, probes in (l.split("\t") for l in in_handle):
-            out.append((chrom, int(start), int(end), math.pow(2,float(log2))))
+            out.append((chrom, int(start), int(end), math.pow(2, float(log2))))
     return out
 
 def parse_bubbletree(in_file):
@@ -126,7 +196,8 @@ def sample_variants_as_vcf(sample, vardict_flat):
         out_handle.write("##fileformat=VCFv4.2\n")
         out_handle.write('##INFO=<ID=AF,Number=A,Type=Float,Description="Allele Frequency">\n')
         out_handle.write('##INFO=<ID=DP,Number=1,Type=Integer,Description="Depth">\n')
-        out_handle.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+        out_handle.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
+        out_handle.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t%s\n" % sample)
         with open(vardict_flat) as in_handle:
             header = in_handle.next().strip().split("\t")
             for line in in_handle:
@@ -140,7 +211,7 @@ def sample_variants_as_vcf(sample, vardict_flat):
                         except ValueError:
                             continue
                         curout = [str(chrom), cur["Start"], ".", cur["Ref"], cur["Alt"], ".", "PASS",
-                                  "AF=%s;DP=%s" % (cur["AlleleFreq"], cur["Depth"])]
+                                  "AF=%s;DP=%s" % (cur["AlleleFreq"], cur["Depth"]), "GT", "0/1"]
                         out_handle.write("\t".join(curout) + "\n")
     return out_file
 
