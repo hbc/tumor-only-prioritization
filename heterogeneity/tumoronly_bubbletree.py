@@ -25,12 +25,13 @@ def main(vardict_flat, seq2c_input, annotate_conf, priority_file, name):
     cnv_samples = read_samples(seq2c_input)
     freq_out_file = "%s-dlbcl-af-dist.pdf" % name
     sample_freqs = collections.defaultdict(dict)
+    known_freqs = {}
     with PdfPages(freq_out_file) as pdf_out:
         for i, sample in enumerate(sorted(list(var_samples & cnv_samples))):
             sample_vcf = annotate_vcf(sample_variants_as_vcf(sample, vardict_flat), annotate_conf)
             seq2c_cns = sample_seq2c_as_cns(sample, seq2c_input)
-            known_afs = prioritize_variants(sample_vcf, seq2c_cns, priority_file)
-            print sample, known_afs
+            known_genes, known_positions = prioritize_variants(sample_vcf, seq2c_cns, priority_file)
+            print sample, known_genes
             vrn_info = {"vrn_file": sample_vcf, "variantcaller": "vardict"}
             calls_by_name = {"seq2c": {"cns": seq2c_cns,
                                        "variantcaller": "seq2c"}}
@@ -43,36 +44,47 @@ def main(vardict_flat, seq2c_input, annotate_conf, priority_file, name):
                 bubbletree.run(vrn_info, calls_by_name, somatic_info, do_plots=False)
                 bubbletree_out = glob.glob(os.path.join("heterogeneity", sample, "bubbletree",
                                                         "*_prevalence.txt"))
-            freqs = plot_frequencies(sample, sample_vcf, seq2c_cns, bubbletree_out[0], pdf_out)
-            for driver in known_afs:
+            freqs, sample_known_freqs = plot_frequencies(sample, sample_vcf, seq2c_cns, known_positions,
+                                                         bubbletree_out[0], pdf_out)
+            known_freqs[sample] = sample_known_freqs
+            for driver in known_genes:
                 sample_freqs[driver][sample] = freqs
+
     for driver, cur_sample_freqs in sample_freqs.items():
         if len(cur_sample_freqs) > 1:
             print driver, len(cur_sample_freqs)
             comparison_out_file = "%s-af-comparison-%s.pdf" % (name, driver.split(":")[-1])
-            comparison_plot(driver, cur_sample_freqs, comparison_out_file)
+            comparison_plot(driver, cur_sample_freqs, known_freqs, comparison_out_file)
 
-def comparison_plot(driver, sample_freqs, out_file):
+def comparison_plot(driver, sample_freqs, known_freqs, out_file):
     metrics = {"sample": [], "af": []}
+    known_metrics = {"sample": [], "af": []}
     for sample, freqs in sorted(sample_freqs.items()):
-        sample = sample.split("_")[0].replace("AZ-", "")
-        metrics["sample"].extend([sample] * len(freqs))
+        sample_label = sample.split("_")[0].replace("AZ-", "")
+        metrics["sample"].extend([sample_label] * len(freqs))
         metrics["af"].extend(freqs)
+        for kfreq in known_freqs[sample]:
+            known_metrics["sample"].append(sample_label)
+            known_metrics["af"].append(kfreq)
 
     df = pd.DataFrame(metrics)
+    df_known = pd.DataFrame(known_metrics)
     sns.despine()
     sns.set(style="white")
     g = sns.violinplot(x="af", y="sample", data=df, inner=None)
-    #sns.swarmplot(x="af", y="sample", data=df, color="w", alpha=.5)
+    if len(df_known) > 0:
+        sns.swarmplot(x="af", y="sample", data=df_known, color="w", alpha=.5)
     g.set_title(driver)
     g.set_xlim(0, 1.0)
     g.figure.savefig(out_file)
     plt.clf()
 
-def plot_frequencies(sample, sample_vcf, seq2c_cns, bubbletree_out, pdf_out):
+def plot_frequencies(sample, sample_vcf, seq2c_cns, known_positions,
+                     bubbletree_out, pdf_out):
     """Plot non-germline frequencies, adjusted by purity and copy number.
     """
     freqs = []
+    known_freqs = []
     copy_adjust = cns_to_relative_copy(seq2c_cns)
     purity = parse_bubbletree(bubbletree_out)
     for rec in pysam.VariantFile(sample_vcf):
@@ -88,6 +100,8 @@ def plot_frequencies(sample, sample_vcf, seq2c_cns, bubbletree_out, pdf_out):
             # adjustment gives a non-sense frequency
             if af < 1:
                 freqs.append(af)
+                if (rec.chrom, rec.start) in known_positions:
+                    known_freqs.append(af)
 
     sns.despine()
     sns.set(style="white")
@@ -97,19 +111,21 @@ def plot_frequencies(sample, sample_vcf, seq2c_cns, bubbletree_out, pdf_out):
     g.set_xlabel("Adjusted allele frequency (copy number and purity)")
     pdf_out.savefig(g.figure)
     plt.clf()
-    return freqs
+    return freqs, known_freqs
 
 def prioritize_variants(vcf_file, cns_file, priority_file):
     """Find known cancer associated genes in small variants and CNVs.
     """
-    known = _prioritize_vcf(vcf_file, priority_file) + _prioritize_cns(cns_file, priority_file)
+    known, known_positions = _prioritize_vcf(vcf_file, priority_file)
+    known += _prioritize_cns(cns_file, priority_file)
     if known:
         if len(known) > 7:
-            return ["multiple"]
+            known = ["multiple"]
         else:
-            return list(set(known))
+            known = list(set(known))
     else:
-        return ["unclassified"]
+        known = ["unclassified"]
+    return known, known_positions
 
 def _prioritize_vcf(in_file, priority_file):
     out_file = "%s-known.vcf.gz" % utils.splitext_plus(in_file)[0]
@@ -117,11 +133,13 @@ def _prioritize_vcf(in_file, priority_file):
         cmd = ["bcbio-prioritize", "known", "-i", in_file, "-k", priority_file, "-o", out_file]
         subprocess.check_call(cmd)
     known = []
+    known_positions = set([])
     if vcfutils.vcf_has_variants(out_file):
         for rec in pysam.VariantFile(out_file):
             if not bubbletree.is_population_germline(rec):
                 known.extend(rec.info["KNOWN"])
-    return known
+                known_positions.add((rec.chrom, rec.start))
+    return known, known_positions
 
 def _chr_sort(region):
     chrom, start, end = region[:3]
