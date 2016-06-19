@@ -39,7 +39,8 @@ def main(config_file):
     with PdfPages(freq_out_file) as pdf_out:
         with open(db_out_file, "w") as out_handle:
             writer = csv.writer(out_handle)
-            writer.writerow(["sample", "known_sample", "cohort", "status", "af", "known", "group", "group_class"])
+            writer.writerow(["sample", "known_sample", "cohort", "status",
+                             "adjust_af", "af", "pos", "known", "group", "group_class"])
             for i, sample in enumerate(sorted(list(var_samples & cnv_samples))):
                 sample_vcf = annotate_vcf(sample_variants_as_vcf(sample, config.variants,
                                                                  config.name_parser, work_dir),
@@ -62,10 +63,11 @@ def main(config_file):
                 freqs = plot_frequencies(sample, sample_vcf, seq2c_cns, known_positions,
                                          bubbletree_out[0], pdf_out)
                 group_id, group_class = group_info.get(sample, ("", ""))
-                for freq, known in freqs:
+                for adjust_af, af, position, known in freqs:
                     writer.writerow([sample, ";".join(known_genes),
-                                     cohort_info[sample], status_info[sample], freq, known or "",
-                                     group_id, group_class])
+                                     cohort_info[sample], status_info[sample],
+                                     adjust_af, af, position,
+                                     known or "", group_id, group_class])
 
                 for driver in known_genes:
                     sample_freqs[driver][sample] = freqs
@@ -79,24 +81,22 @@ def main(config_file):
 
 def comparison_plot(driver, sample_freqs, known_freqs, pdf_out):
     metrics = {"sample": [], "af": []}
-    known_metrics = {"sample": [], "af": []}
     for sample, freqs in sorted(sample_freqs.items()):
         sample_label = sample
+        freqs = [x[0] for x in freqs if x[0] < 1.0]
         metrics["sample"].extend([sample_label] * len(freqs))
-        metrics["af"].extend([x[0] for x in freqs])
-        for kfreq in [f for f, k in freqs if k is not None]:
-            known_metrics["sample"].append(sample_label)
-            known_metrics["af"].append(kfreq)
+        metrics["af"].extend(freqs)
 
     df = pd.DataFrame(metrics)
     sns.despine()
     sns.set(style="white")
     g = sns.violinplot(x="af", y="sample", data=df, inner=None)
-    # df_known = pd.DataFrame(known_metrics)
-    # if len(df_known) > 0:
-    #     sns.swarmplot(x="af", y="sample", data=df_known, color="w", alpha=.5)
     g.set_title(driver)
     g.set_xlim(0, 1.0)
+    g.set_xlabel("Adjusted allele frequency (copy number and purity)")
+    g.tick_params(axis="y", which="major", labelsize=8)
+    g.set_ylabel("")
+    g.figure.tight_layout()
     pdf_out.savefig(g.figure)
     # g.figure.savefig(out_file)
     plt.clf()
@@ -117,14 +117,13 @@ def plot_frequencies(sample, sample_vcf, seq2c_cns, known_positions,
                     break
             baf = float(rec.info["AF"][0] if isinstance(rec.info["AF"], (tuple, list)) else rec.info["AF"])
             af = (baf * cur_copy_adjust) / purity
-            # larger than one variants are likely germline since contamination
-            # adjustment gives a non-sense frequency
-            if af < 1:
-                freqs.append((af, known_positions.get((rec.chrom, rec.start))))
+            freqs.append((af, baf, "%s:%s" % (rec.chrom, rec.start), known_positions.get((rec.chrom, rec.start))))
 
     sns.despine()
     sns.set(style="white")
-    g = sns.distplot([x[0] for x in freqs], kde=False, rug=True, bins=20)
+    # larger than one variants are likely germline since contamination
+    # adjustment gives a non-sense frequency
+    g = sns.distplot([x[0] for x in freqs if x[0] < 1.0], kde=False, rug=True, bins=20)
     g.set_title("%s: purity %0.1f%%" % (sample, purity * 100.0))
     g.set_xlim(0, 1.0)
     g.set_xlabel("Adjusted allele frequency (copy number and purity)")
@@ -138,7 +137,7 @@ def prioritize_variants(vcf_file, cns_file, priority_file):
     known, known_positions = _prioritize_vcf(vcf_file, priority_file)
     known += _prioritize_cns(cns_file, priority_file)
     if known:
-        if len(known) > 10:
+        if len(set(known)) > 15:
             known = ["multiple"]
         else:
             known = list(set(known))
