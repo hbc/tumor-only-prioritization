@@ -2,6 +2,7 @@
 """Plot cohort sample grouping and comparisons from pre-calculated heterogeneity.
 """
 import collections
+import imp
 import os
 import sys
 
@@ -12,21 +13,36 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
-def main(freq_files):
-    af_key = "adjust_af"
-    #af_key = "af"
+def main(input_files):
+    if len(input_files) > 0 and input_files[0].endswith(".py"):
+        config_file = input_files[0]
+        freq_files = input_files[1:]
+    else:
+        config_file = None
+        freq_files = input_files
+    config = imp.load_source("config", config_file) if config_file else None
     plot_dir = utils.safe_makedir("plots")
     df = pd.concat([pd.read_csv(f) for f in freq_files])
+    organize_samples(df)
+    plot_af_adjustments(df, plot_dir, config)
+
+    af_key = "adjust_af"
+    # af_key = "af"
     df = df[df[af_key] < 1.0]
-    fishplot_by_groups(df, plot_dir, af_key)
-    plot_by_groups(df, plot_dir, af_key)
-    plot_by_genes(df, plot_dir, af_key)
+    fishplot_by_groups(df, plot_dir, af_key, config)
+    plot_by_groups(df, plot_dir, af_key, config)
+    plot_by_genes(df, plot_dir, af_key, config)
+
+def organize_samples(df):
+    out_file = "db/samples-by-cohort.csv"
+    df = df[["sample", "cohort", "status", "group", "group_class"]].drop_duplicates()
+    df.to_csv(out_file, index_label="sample")
 
 def _round_freq(freq):
     #return int(round(freq * 100.0, -1))
     return int(round(freq * 100.0 / 20.0) * 20)
 
-def fishplot_by_groups(df, plot_dir, af_key):
+def fishplot_by_groups(df, plot_dir, af_key, config):
     """Group samples into clones by frequency changes for plotting.
     """
     for (cohort, group), cur_df in df.groupby(["cohort", "group"]):
@@ -43,11 +59,16 @@ def fishplot_by_groups(df, plot_dir, af_key):
                 else:
                     raise ValueError("Unexpected group: %s" % row["group_class"])
             clones[(pre, post, known)] += 1
-        print cohort, group
-        import pprint
-        pprint.pprint(dict(clones))
+        try:
+            group = int(group)
+        except ValueError:
+            pass
+        if not config or(cohort, group) in config.group_detailed:
+            print cohort, group
+            import pprint
+            pprint.pprint(dict(clones))
 
-def plot_by_groups(df, plot_dir, af_key):
+def plot_by_groups(df, plot_dir, af_key, config):
     """Plot allele frequencies of grouped/paired samples.
     """
     out_file = os.path.join(plot_dir, "cohort-group-af-comparison.pdf")
@@ -68,10 +89,51 @@ def plot_by_groups(df, plot_dir, af_key):
             g.set_title("%s: %s" % (cohort, group))
             g = _af_violinplot_shared(g)
             pdf_out.savefig(g.figure)
+            if config and (cohort, group) in config.group_detailed:
+                out_dir = utils.safe_makedir(os.path.join(plot_dir, "detailed"))
+                out_file = os.path.join(out_dir, "group-%s-%s.png" % (cohort, group))
+                g.figure.savefig(out_file)
             plt.clf()
     return out_file
 
-def plot_by_genes(df, plot_dir, af_key):
+def plot_af_adjustments(df, plot_dir, config):
+    """Plot results of adjusting allele frequencies in groups
+    """
+    out_file = os.path.join(plot_dir, "summarize-af-adjustment.pdf")
+    df["sample_label"] = df.apply(lambda row: "%s\n%s" % (row["group_class"], row["sample"]), axis=1)
+    sns.despine()
+    sns.set(style="white")
+    with PdfPages(out_file) as pdf_out:
+        for (cohort, group), cur_df in df.groupby(["cohort", "group"]):
+            labels = sorted(list(cur_df["sample_label"].unique()))
+            labels.reverse()
+            cur_df["sample_label"].categories = labels
+            cur_df = cur_df[["sample_label", "adjust_af", "af"]]
+            cur_df = pd.melt(cur_df, id_vars=["sample_label"], value_vars=["adjust_af", "af"],
+                             var_name="Allele frequency")
+            cur_df["Allele frequency"] = cur_df["Allele frequency"].map({"adjust_af": "Purity and copy adjusted",
+                                                                         "af": "Raw"})
+            g = sns.violinplot(x="value", y="sample_label", data=cur_df, inner=None, bw=.1,
+                               hue="Allele frequency", split=True)
+            try:
+                group = int(group)
+            except ValueError:
+                pass
+            g.set_title("%s: %s" % (cohort, group))
+            g.set_xlabel("Allele frequency")
+            g.set_xlim(0, 1.0)
+            g.tick_params(axis="y", which="major", labelsize=8)
+            g.set_ylabel("")
+            g.figure.tight_layout()
+            pdf_out.savefig(g.figure)
+            if config and (cohort, group) in config.group_detailed:
+                out_dir = utils.safe_makedir(os.path.join(plot_dir, "detailed"))
+                out_file = os.path.join(out_dir, "af-adjustment-%s-%s.png" % (cohort, group))
+                g.figure.savefig(out_file)
+            plt.clf()
+    return out_file
+
+def plot_by_genes(df, plot_dir, af_key, config):
     """Plot allele frequencies of known cancer genes in primary, relapse status
     """
     out_file = os.path.join(plot_dir, "driver-af-comparison.pdf")
@@ -102,6 +164,10 @@ def plot_by_genes(df, plot_dir, af_key):
                     g.set_title("%s -- %s" % (cohort, gene))
                     g = _af_violinplot_shared(g)
                     pdf_out.savefig(g.figure)
+                    if config and (cohort, gene) in config.driver_detailed:
+                        out_dir = utils.safe_makedir(os.path.join(plot_dir, "detailed"))
+                        out_file = os.path.join(out_dir, "driver-%s-%s.png" % (cohort, gene))
+                        g.figure.savefig(out_file)
                     plt.clf()
     return out_file
 

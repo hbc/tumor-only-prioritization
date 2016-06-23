@@ -57,7 +57,15 @@ def main(config_file):
                 bubbletree_out = glob.glob(os.path.join("heterogeneity", sample, "bubbletree",
                                                         "*_prevalence.txt"))
                 if len(bubbletree_out) == 0:
-                    bubbletree.run(vrn_info, calls_by_name, somatic_info, do_plots=False)
+                    try:
+                        bubbletree.run(vrn_info, calls_by_name, somatic_info, do_plots=False,
+                                       handle_failures=False)
+                    except subprocess.CalledProcessError:
+                        out_file = os.path.join("heterogeneity", sample, "bubbletree",
+                                                "%s_prevalence.txt" % sample)
+                        with open(out_file, "w") as out_handle:
+                            out_handle.write('"sample","purity","prevalences","tumor_ploidy"\n')
+                            out_handle.write("%s,1.0,1.0,2.0\n" % sample)
                     bubbletree_out = glob.glob(os.path.join("heterogeneity", sample, "bubbletree",
                                                             "*_prevalence.txt"))
                 freqs = plot_frequencies(sample, sample_vcf, seq2c_cns, known_positions,
@@ -105,6 +113,7 @@ def plot_frequencies(sample, sample_vcf, seq2c_cns, known_positions,
                      bubbletree_out, pdf_out):
     """Plot non-germline frequencies, adjusted by purity and copy number.
     """
+    do_plot = False
     freqs = []
     copy_adjust = cns_to_relative_copy(seq2c_cns)
     purity = parse_bubbletree(bubbletree_out)
@@ -119,16 +128,17 @@ def plot_frequencies(sample, sample_vcf, seq2c_cns, known_positions,
             af = (baf * cur_copy_adjust) / purity
             freqs.append((af, baf, "%s:%s" % (rec.chrom, rec.start), known_positions.get((rec.chrom, rec.start))))
 
-    sns.despine()
-    sns.set(style="white")
-    # larger than one variants are likely germline since contamination
-    # adjustment gives a non-sense frequency
-    g = sns.distplot([x[0] for x in freqs if x[0] < 1.0], kde=False, rug=True, bins=20)
-    g.set_title("%s: purity %0.1f%%" % (sample, purity * 100.0))
-    g.set_xlim(0, 1.0)
-    g.set_xlabel("Adjusted allele frequency (copy number and purity)")
-    pdf_out.savefig(g.figure)
-    plt.clf()
+    if do_plot:
+        sns.despine()
+        sns.set(style="white")
+        # larger than one variants are likely germline since contamination
+        # adjustment gives a non-sense frequency
+        g = sns.distplot([x[0] for x in freqs if x[0] < 1.0], kde=False, rug=True, bins=20)
+        g.set_title("%s: purity %0.1f%%" % (sample, purity * 100.0))
+        g.set_xlim(0, 1.0)
+        g.set_xlabel("Adjusted allele frequency (copy number and purity)")
+        pdf_out.savefig(g.figure)
+        plt.clf()
     return freqs
 
 def prioritize_variants(vcf_file, cns_file, priority_file):
@@ -171,7 +181,7 @@ def _chr_sort(region):
 
 def _prioritize_cns(in_file, priority_file):
     out_file = "%s-known.bed.gz" % utils.splitext_plus(in_file)[0]
-    if not utils.file_uptodate(out_file, in_file):
+    if not utils.file_exists(out_file):
         bed_file = "%s.bed" % utils.splitext_plus(in_file)[0]
         if not utils.file_uptodate(bed_file, in_file):
             cn_changes = []
@@ -211,55 +221,58 @@ def sample_seq2c_as_cns(sample, inputs, name_parser, work_dir):
     """Extract seq2c sample output as a CNS formatted file.
     """
     out_file = os.path.join(work_dir, "%s.cns" % sample)
-    with open(out_file, "w") as out_handle:
-        writer = csv.writer(out_handle, dialect="excel-tab")
-        header = ["chromosome", "start", "end", "gene", "log2", "probes"]
-        writer.writerow(header)
-        for input in inputs:
-            with open(input) as in_handle:
-                header = in_handle.readline().strip().split("\t")
-                for line in in_handle:
-                    parts = line.split("\t")
-                    name = name_parser(parts[0])
-                    if name == sample:
-                        cur = dict(zip(header, parts))
-                        writer.writerow([cur["Chr"], cur["Start"], cur["End"], cur["Gene"], cur["Log2ratio"],
-                                        cur["Total_Seg"]])
+    if not utils.file_exists(out_file):
+        with open(out_file, "w") as out_handle:
+            writer = csv.writer(out_handle, dialect="excel-tab")
+            header = ["chromosome", "start", "end", "gene", "log2", "probes"]
+            writer.writerow(header)
+            for input in inputs:
+                with open(input) as in_handle:
+                    header = in_handle.readline().strip().split("\t")
+                    for line in in_handle:
+                        parts = line.split("\t")
+                        name = name_parser(parts[0])
+                        if name == sample:
+                            cur = dict(zip(header, parts))
+                            writer.writerow([cur["Chr"], cur["Start"], cur["End"], cur["Gene"], cur["Log2ratio"],
+                                            cur["Total_Seg"]])
     return out_file
 
 def sample_variants_as_vcf(sample, inputs, name_parser, work_dir):
     """Retrieve variants for the input sample
     """
     out_file = os.path.join(work_dir, "%s.vcf" % sample)
-    with open(out_file, "w") as out_handle:
-        out_handle.write("##fileformat=VCFv4.2\n")
-        out_handle.write('##INFO=<ID=AF,Number=A,Type=Float,Description="Allele Frequency">\n')
-        out_handle.write('##INFO=<ID=DP,Number=1,Type=Integer,Description="Depth">\n')
-        out_handle.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
-        out_handle.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t%s\n" % sample)
-        for input in inputs:
-            with open(input) as in_handle:
-                header = in_handle.next().strip().split("\t")
-                for line in in_handle:
-                    parts = line.strip().split("\t")
-                    name = name_parser(parts[0])
-                    if name == sample:
-                        cur = dict(zip(header, parts))
-                        if len(cur["Ref"]) == 1 and len(cur["Alt"]) == 1:
-                            chrom = cur["Chr"].replace("chr", "")
-                            try:
-                                chrom = int(chrom)
-                            except ValueError:
-                                continue
-                            curout = [str(chrom), cur["Start"], ".", cur["Ref"], cur["Alt"], ".", "PASS",
-                                    "AF=%s;DP=%s" % (cur["AlleleFreq"], cur["Depth"]), "GT", "0/1"]
-                            out_handle.write("\t".join(curout) + "\n")
+    if not utils.file_exists(out_file):
+        with open(out_file, "w") as out_handle:
+            out_handle.write("##fileformat=VCFv4.2\n")
+            out_handle.write('##INFO=<ID=AF,Number=A,Type=Float,Description="Allele Frequency">\n')
+            out_handle.write('##INFO=<ID=DP,Number=1,Type=Integer,Description="Depth">\n')
+            out_handle.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
+            out_handle.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t%s\n" % sample)
+            for input in inputs:
+                with open(input) as in_handle:
+                    header = in_handle.next().strip().split("\t")
+                    for line in in_handle:
+                        parts = line.strip().split("\t")
+                        name = name_parser(parts[0])
+                        if name == sample:
+                            cur = dict(zip(header, parts))
+                            if len(cur["Ref"]) == 1 and len(cur["Alt"]) == 1:
+                                chrom = cur["Chr"].replace("chr", "")
+                                try:
+                                    chrom = int(chrom)
+                                except ValueError:
+                                    continue
+                                curout = [str(chrom), cur["Start"], ".", cur["Ref"], cur["Alt"], ".", "PASS",
+                                        "AF=%s;DP=%s" % (cur["AlleleFreq"], cur["Depth"]), "GT", "0/1"]
+                                out_handle.write("\t".join(curout) + "\n")
     return out_file
 
 def annotate_vcf(in_file, conf_file):
     out_file = "%s-annotate.vcf.gz" % os.path.splitext(in_file)[0]
     if not utils.file_exists(out_file):
-        cmd = "vcfanno {conf_file} {in_file} | bgzip -c > {out_file}"
+        cmd = ("vt sort {in_file} -m local -w 100000000 2> /dev/null | "
+               "vcfanno {conf_file} /dev/stdin | bgzip -c > {out_file}")
         subprocess.check_call(cmd.format(**locals()), shell=True)
     vcfutils.bgzip_and_index(out_file)
     return out_file
